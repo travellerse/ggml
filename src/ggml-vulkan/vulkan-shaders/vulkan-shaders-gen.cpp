@@ -752,9 +752,16 @@ void process_shaders() {
 #if defined(GGML_VULKAN_INTEGER_DOT_GLSLC_SUPPORT)
             string_to_spv("flash_attn_f32_f16", "flash_attn.comp",
                 merge_maps(fa_base_dict, {{"Q_TYPE", "float"}, {"D_TYPE", "float"}, {"D_TYPEV4", "vec4"}, {"MMQ", "1"}, {"FA_MMQ_MIXED", "1"}}), fp16, false, false, f16acc, "_int8");
+
 #endif
         }
-    }
+
+        }
+
+    // experimental INT8-QK attention prototype (P1-B); dispatched only when
+    // GGML_VK_FA_INT8QK is set.
+    string_to_spv("flash_attn_int8qk", "flash_attn_int8qk.comp", {}, false, false, false, false);
+    string_to_spv("flash_attn_int8qk_diag", "flash_attn_int8qk.comp", {{"DIAG", "1"}}, false, false, false, false);
 
     const std::map<std::string, std::string> fa_bf16_dict = {
         {"FLOAT_TYPE",   "bfloat16_t"},
@@ -959,6 +966,10 @@ void process_shaders() {
     string_to_spv("fa_pad_kv", "fa_pad_kv.comp", {});
 
 #if defined(GGML_VULKAN_INTEGER_DOT_GLSLC_SUPPORT)
+    string_to_spv("quantize_qk_i8", "quantize_qk_i8.comp", {});
+    string_to_spv("quantize_qk_i8_f16", "quantize_qk_i8.comp", {{"DATA_F16", "1"}});
+    string_to_spv("quantize_qk_i8_diag", "quantize_qk_i8.comp", {{"DIAG", "1"}});
+    string_to_spv("quantize_qk_i8_f16_diag", "quantize_qk_i8.comp", {{"DATA_F16", "1"}, {"DIAG", "1"}});
 #if defined(GGML_VULKAN_COOPMAT_GLSLC_SUPPORT)
 #endif
 #if defined(GGML_VULKAN_COOPMAT2_GLSLC_SUPPORT)

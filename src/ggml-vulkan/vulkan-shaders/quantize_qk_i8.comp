@@ -1,0 +1,74 @@
+#version 450
+
+// Per-row symmetric INT8 quantisation for the experimental INT8-QK attention.
+// One workgroup per (head, row); 128 threads cover the D = 128 head dimension.
+// Writes packed int8 words plus the per-row scale.
+
+#extension GL_EXT_control_flow_attributes : enable
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+
+layout(local_size_x = 128) in;
+
+layout(push_constant) uniform P {
+    uint rows;            // rows per head
+    uint words_per_row;   // 32
+    uint a_base;          // f32 elements, head 0 row 0
+    uint a_row_stride;    // f32 elements between rows
+    uint a_head_stride;   // f32 elements between heads
+    uint s_base;          // f32 element offset for the scale slab
+} p;
+
+#ifdef DATA_F16
+layout(binding = 0, std430) readonly buffer A { float16_t data_a[]; };
+#else
+layout(binding = 0, std430) readonly buffer A { float data_a[]; };
+#endif
+layout(binding = 1, std430) writeonly buffer Q { uint data_q[]; };
+layout(binding = 2, std430) writeonly buffer S { float data_s[]; };
+
+shared float red[128];
+shared int   q8sh[128];
+
+void main() {
+    const uint row  = gl_WorkGroupID.x;
+    const uint head = gl_WorkGroupID.y;
+    const uint tid  = gl_LocalInvocationID.x;
+
+#ifdef DATA_F16
+    const float v = float(data_a[p.a_base + head * p.a_head_stride + row * p.a_row_stride + tid]);
+#else
+    const float v = data_a[p.a_base + head * p.a_head_stride + row * p.a_row_stride + tid];
+#endif
+
+    red[tid] = abs(v);
+    barrier();
+    [[unroll]] for (int s = 64; s > 0; s >>= 1) {
+        if (tid < uint(s)) {
+            red[tid] = max(red[tid], red[tid + uint(s)]);
+        }
+        barrier();
+    }
+    const float scale = red[0] > 0.0f ? red[0] / 127.0f : 1.0f;
+
+    float q = v / scale;
+    q = clamp(q, -127.0f, 127.0f);
+    q8sh[tid] = int(round(q));
+    barrier();
+
+    if (tid < p.words_per_row) {
+        const uint base = (head * p.rows + row) * p.words_per_row + tid;
+        uint packed = 0u;
+        [[unroll]] for (uint b = 0; b < 4; ++b) {
+            packed |= (uint(uint8_t(int8_t(q8sh[tid * 4 + b])))) << (8 * b);
+        }
+        data_q[base] = packed;
+    }
+    if (tid == 0) {
+#ifdef DIAG
+        data_s[p.s_base + head * p.rows + row] = red[0];  // amax probe
+#else
+        data_s[p.s_base + head * p.rows + row] = scale;
+#endif
+    }
+}

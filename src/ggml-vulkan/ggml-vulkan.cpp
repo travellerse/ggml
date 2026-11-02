@@ -3207,6 +3207,47 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
 
     ggml_vk_create_pipeline(device, device->pipeline_matmul_split_k_reduce, "split_k_reduce", split_k_reduce_len, split_k_reduce_data, "main", 2, 2 * sizeof(uint32_t), {256 * 4, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_flash_attn_split_k_reduce, "fa_split_k_reduce", fa_split_k_reduce_len, fa_split_k_reduce_data, "main", 3, sizeof(vk_op_flash_attn_split_k_reduce_push_constants), {1, device->subgroup_size, 1}, {device->subgroup_size}, 1, true);
+    {
+        // GGML_VK_FA_INT8QK_DIAG swaps in a build that dumps KV/N/Lf/Mf into the
+        // first output slots; used only for the execution-path audit.
+        const bool diag = getenv("GGML_VK_FA_INT8QK_DIAG") != nullptr;
+        ggml_vk_create_pipeline(device, device->pipeline_fa_int8qk, diag ? "flash_attn_int8qk_diag" : "flash_attn_int8qk",
+                                diag ? flash_attn_int8qk_diag_fp32_len : flash_attn_int8qk_fp32_len,
+                                diag ? flash_attn_int8qk_diag_fp32_data : flash_attn_int8qk_fp32_data, "main", 5,
+                                sizeof(vk_fa_int8qk_push_constants), {1, 1, 1}, {}, 1, true, false, 0);
+    }
+    {
+        const bool diag = getenv("GGML_VK_FA_INT8QK_DIAG") != nullptr;
+        ggml_vk_create_pipeline(device, device->pipeline_quantize_qk_i8,
+                                diag ? "quantize_qk_i8_diag" : "quantize_qk_i8",
+                                diag ? quantize_qk_i8_diag_len : quantize_qk_i8_len,
+                                diag ? quantize_qk_i8_diag_data : quantize_qk_i8_data, "main", 3,
+                                sizeof(vk_quantize_qk_i8_push_constants), {1, 1, 1}, {}, 1, true, false, 0);
+        ggml_vk_create_pipeline(device, device->pipeline_quantize_qk_i8_f16,
+                                diag ? "quantize_qk_i8_f16_diag" : "quantize_qk_i8_f16",
+                                diag ? quantize_qk_i8_f16_diag_len : quantize_qk_i8_f16_len,
+                                diag ? quantize_qk_i8_f16_diag_data : quantize_qk_i8_f16_data, "main", 3,
+                                sizeof(vk_quantize_qk_i8_push_constants), {1, 1, 1}, {}, 1, true, false, 0);
+    }
+
+    if (getenv("GGML_VK_FA_INT8QK_DEBUG") != nullptr) {
+        auto fnv = [](const void * p, size_t n) {
+            const uint8_t * b = (const uint8_t *) p;
+            uint64_t h = 1469598103934665603ull;
+            for (size_t i = 0; i < n; ++i) { h = (h ^ b[i]) * 1099511628211ull; }
+            return h;
+        };
+        auto dump = [&](const char * nm, vk_pipeline & pl, size_t len, const void * data) {
+            fprintf(stderr, "[i8qk-create] %s spv_len=%zu fnv=%016llx\n", nm, len, (unsigned long long) fnv(data, len));
+            fprintf(stderr, "[i8qk-create]   initialized=%d param_count=%u pc_size=%u wg_denoms=(%u,%u,%u) pipeline=%p layout=%p\n",
+                    (int) pl->initialized, pl->parameter_count, pl->push_constant_size,
+                    pl->wg_denoms[0], pl->wg_denoms[1], pl->wg_denoms[2],
+                    (void *) (VkPipeline) pl->pipeline, (void *) (VkPipelineLayout) pl->layout);
+        };
+        dump("flash_attn_int8qk", device->pipeline_fa_int8qk, flash_attn_int8qk_fp32_len, flash_attn_int8qk_fp32_data);
+        dump("quantize_qk_i8", device->pipeline_quantize_qk_i8, quantize_qk_i8_len, quantize_qk_i8_data);
+        dump("quantize_qk_i8_f16", device->pipeline_quantize_qk_i8_f16, quantize_qk_i8_f16_len, quantize_qk_i8_f16_data);
+    }
 
 #if defined(VK_KHR_cooperative_matrix) && defined(GGML_VULKAN_COOPMAT_GLSLC_SUPPORT)
     if (device->vendor_id == VK_VENDOR_ID_INTEL && (device->architecture == INTEL_XE2 || (device->architecture == INTEL_XE1 && device->coopmat_support && device->uma))) {
@@ -8184,6 +8225,28 @@ bool ggml_vk_flash_attn_coopmat_shmem_support(const vk_device& device, const vk_
     return supported;
 }
 
+static std::atomic<int> g_fa_int8_qk_mode{-1};
+
+void ggml_backend_vk_set_fa_int8_qk(int mode) {
+    g_fa_int8_qk_mode.store(mode == 0 ? 0 : (mode > 0 ? 1 : -1), std::memory_order_relaxed);
+}
+
+// Experimental INT8-QK attention prototype: enabled by the CLI/API switch or, in
+// its absence, by the GGML_VK_FA_INT8QK environment variable, and only for the
+// dense, contiguous, single-batch shape it was validated on.
+static bool fa_int8qk_active(const ggml_backend_vk_context * ctx, const ggml_tensor * q, const ggml_tensor * k,
+                             const ggml_tensor * v, const ggml_tensor * mask, const ggml_tensor * sinks,
+                             bool use_dequant_kv, uint32_t gqa_ratio, uint32_t split_k, float logit_softcap,
+                             bool kv_f16, uint32_t HSK, uint32_t HSV) {
+    static const bool env_enabled = getenv("GGML_VK_FA_INT8QK") != nullptr;
+    const int mode = g_fa_int8_qk_mode.load(std::memory_order_relaxed);
+    const bool enabled = mode < 0 ? env_enabled : (mode != 0);
+    return enabled && ctx->device->pipeline_fa_int8qk != nullptr && mask == nullptr && sinks == nullptr &&
+           !use_dequant_kv && HSK == 128 && HSV == 128 && q->type == GGML_TYPE_F32 && kv_f16 &&
+           q->ne[3] == 1 && q->ne[1] >= 256 && q->ne[2] >= 16 && gqa_ratio == 1 && split_k == 1 && logit_softcap == 0.0f &&
+           ggml_is_contiguous(k) && ggml_is_contiguous(v) && ggml_is_contiguous(q);
+}
+
 void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * q, const ggml_tensor * k, const ggml_tensor * v, const ggml_tensor * mask, const ggml_tensor * sinks, ggml_tensor * dst, const ggml_tensor * affine = nullptr) {
     VK_LOG_DEBUG("ggml_vk_flash_attn((" << q << ", name=" << q->name << ", type=" << q->type << ", ne0=" << q->ne[0] << ", ne1=" << q->ne[1] << ", ne2=" << q->ne[2] << ", ne3=" << q->ne[3] << ", nb0=" << q->nb[0] << ", nb1=" << q->nb[1] << ", nb2=" << q->nb[2] << ", nb3=" << q->nb[3];
     std::cerr << "), (" << k << ", name=" << k->name << ", type=" << k->type << ", ne0=" << k->ne[0] << ", ne1=" << k->ne[1] << ", ne2=" << k->ne[2] << ", ne3=" << k->ne[3] << ", nb0=" << k->nb[0] << ", nb1=" << k->nb[1] << ", nb2=" << k->nb[2] << ", nb3=" << k->nb[3];
@@ -8761,6 +8824,109 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
             pc_ph2, { (uint32_t)ph2_wg, (uint32_t)nev2, (uint32_t)neq3 });
 
         ctx->prealloc_x_need_sync = true;
+    } else if (fa_int8qk_active(ctx, q, k, v, mask, sinks, use_dequant_kv, gqa_ratio, split_k, logit_softcap, kv_f16, HSK, HSV)) {
+        // ---- experimental INT8-QK attention prototype (GGML_VK_FA_INT8QK) ----
+        if (getenv("GGML_VK_FA_INT8QK_DEBUG") != nullptr) {
+            static int dbg_count = 0;
+            if (dbg_count < 6) { fprintf(stderr, "[i8qk] q ne=[%lld,%lld,%lld,%lld] k ne=[%lld,%lld,%lld,%lld] v ne=[%lld,%lld,%lld,%lld]\n",
+                (long long) q->ne[0], (long long) q->ne[1], (long long) q->ne[2], (long long) q->ne[3],
+                (long long) k->ne[0], (long long) k->ne[1], (long long) k->ne[2], (long long) k->ne[3],
+                (long long) v->ne[0], (long long) v->ne[1], (long long) v->ne[2], (long long) v->ne[3]); }
+            if (dbg_count < 6) { fprintf(stderr, "[i8qk] dst ne=[%lld,%lld,%lld,%lld] nb=[%zu,%zu,%zu,%zu] q nb=[%zu,%zu,%zu] v nb=[%zu,%zu,%zu]\n",
+                (long long) dst->ne[0], (long long) dst->ne[1], (long long) dst->ne[2], (long long) dst->ne[3],
+                dst->nb[0], dst->nb[1], dst->nb[2], dst->nb[3], q->nb[0], q->nb[1], q->nb[2], v->nb[0], v->nb[1], v->nb[2]); }
+            if (dbg_count < 6) { fprintf(stderr, "[i8qk] N=%u KV=%u heads=%u Tr=%u scale=%.6f vrow=%u vhead=%u vbase=%u orow=%u ohead=%u qoff=%u koff=%u qnb1=%zu knb1=%zu\n",
+                (uint32_t) N, (uint32_t) KV, (uint32_t) n_head_kv, (uint32_t) Tr, (double) scale,
+                (uint32_t) (v->nb[1] / 8), (uint32_t) (v->nb[2] / 8), (uint32_t) (v_buf.offset / 8),
+                (uint32_t) (dst->nb[1] / 16), (uint32_t) (dst->nb[2] / 16),
+                (uint32_t) (q_buf.offset / 4), (uint32_t) (k_buf.offset / 2),
+                (size_t) q->nb[1], (size_t) k->nb[1]); ++dbg_count; }
+        }
+        static vk_buffer i8qk_q8, i8qk_k8, i8qk_sc;
+        const uint32_t n_rows_q = (uint32_t) N;
+        const uint32_t n_rows_k = (uint32_t) KV;
+        const uint32_t heads    = (uint32_t) n_head_kv;
+        const uint64_t q8_sz = (uint64_t) heads * n_rows_q * HSK;
+        const uint64_t k8_sz = (uint64_t) heads * n_rows_k * HSK;
+        const uint64_t sc_sz = (uint64_t) heads * (n_rows_q + n_rows_k) * sizeof(float);
+        static uint64_t i8qk_q8_sz = 0, i8qk_k8_sz = 0, i8qk_sc_sz = 0;
+        if (!i8qk_q8 || i8qk_q8_sz < q8_sz) {
+            if (i8qk_q8) { ggml_vk_destroy_buffer(i8qk_q8); }
+            i8qk_q8    = ggml_vk_create_buffer_device(ctx->device, q8_sz);
+            i8qk_q8_sz = q8_sz;
+        }
+        if (!i8qk_k8 || i8qk_k8_sz < k8_sz) {
+            if (i8qk_k8) { ggml_vk_destroy_buffer(i8qk_k8); }
+            i8qk_k8    = ggml_vk_create_buffer_device(ctx->device, k8_sz);
+            i8qk_k8_sz = k8_sz;
+        }
+        if (!i8qk_sc || i8qk_sc_sz < sc_sz) {
+            if (i8qk_sc) { ggml_vk_destroy_buffer(i8qk_sc); }
+            i8qk_sc    = ggml_vk_create_buffer_device(ctx->device, sc_sz);
+            i8qk_sc_sz = sc_sz;
+        }
+        vk_subbuffer q8_sub = ggml_vk_subbuffer(ctx, i8qk_q8, 0);
+        vk_subbuffer k8_sub = ggml_vk_subbuffer(ctx, i8qk_k8, 0);
+        vk_subbuffer sc_sub = ggml_vk_subbuffer(ctx, i8qk_sc, 0);
+
+        // MOSS-style tensors put heads in dimension 1 ([d, h, L]); the generic
+        // FA layout is [d, L, h]. Derive the row/head strides from the shape.
+        const bool heads_in_dim1 = (q->ne[1] == (int64_t) heads);
+        // the output is a separate view: MOSS writes it as [d, head, L] even though
+        // q/k/v are [d, L, head], so derive its strides from dst itself
+        const bool dst_heads_dim1 = (dst->ne[1] == (int64_t) heads);
+        const size_t q_row_sz  = heads_in_dim1 ? q->nb[2] : q->nb[1];
+        const size_t q_head_sz = heads_in_dim1 ? q->nb[1] : q->nb[2];
+        const size_t k_row_sz  = heads_in_dim1 ? k->nb[2] : k->nb[1];
+        const size_t k_head_sz = heads_in_dim1 ? k->nb[1] : k->nb[2];
+        // the descriptor already carries the subbuffer offset, so the in-shader
+        // base must stay 0 (double-counting it reads the wrong memory)
+        const vk_quantize_qk_i8_push_constants pcq = {
+            n_rows_q, HSK / 4,
+            0u,
+            (uint32_t) (q_row_sz / sizeof(float)),
+            (uint32_t) (q_head_sz / sizeof(float)),
+            0,
+        };
+        const vk_quantize_qk_i8_push_constants pck = {
+            n_rows_k, HSK / 4,
+            0u,
+            (uint32_t) (k_row_sz / sizeof(ggml_fp16_t)),
+            (uint32_t) (k_head_sz / sizeof(ggml_fp16_t)),
+            (uint32_t) (heads * n_rows_q),
+        };
+        ggml_pipeline_request_descriptor_sets(ctx, ctx->device->pipeline_quantize_qk_i8, 1);
+        ggml_vk_dispatch_pipeline(ctx, subctx, ctx->device->pipeline_quantize_qk_i8,
+                                  { q_buf, q8_sub, sc_sub }, pcq, { n_rows_q, heads, 1 });
+        ggml_vk_sync_buffers(ctx, subctx);
+        ggml_pipeline_request_descriptor_sets(ctx, ctx->device->pipeline_quantize_qk_i8_f16, 1);
+        ggml_vk_dispatch_pipeline(ctx, subctx, ctx->device->pipeline_quantize_qk_i8_f16,
+                                  { k_buf, k8_sub, sc_sub }, pck, { n_rows_k, heads, 1 });
+        ggml_vk_sync_buffers(ctx, subctx);
+
+        const vk_fa_int8qk_push_constants pcf = {
+            n_rows_q, n_rows_k, heads,
+            HSK / 4, HSK / 4,
+            n_rows_q * (HSK / 4), n_rows_k * (HSK / 4),
+            (uint32_t) ((heads_in_dim1 ? v->nb[2] : v->nb[1]) / (4 * sizeof(ggml_fp16_t))),
+            (uint32_t) ((heads_in_dim1 ? v->nb[1] : v->nb[2]) / (4 * sizeof(ggml_fp16_t))),
+            0u,   // descriptor offset already applied
+            (uint32_t) ((dst_heads_dim1 ? dst->nb[1] : dst->nb[2]) / (4 * sizeof(float))),
+            (uint32_t) ((dst_heads_dim1 ? dst->nb[2] : dst->nb[1]) / (4 * sizeof(float))),
+            (float) scale,
+        };
+        ggml_pipeline_request_descriptor_sets(ctx, ctx->device->pipeline_fa_int8qk, 1);
+        if (getenv("GGML_VK_FA_INT8QK_DEBUG") != nullptr) {
+            fprintf(stderr, "[i8qk-dispatch] pipeline=%p name=%s initialized=%d params=%u pc=%u\n",
+                    (void *) (VkPipeline) ctx->device->pipeline_fa_int8qk->pipeline,
+                    ctx->device->pipeline_fa_int8qk->name.c_str(),
+                    (int) ctx->device->pipeline_fa_int8qk->initialized,
+                    ctx->device->pipeline_fa_int8qk->parameter_count,
+                    ctx->device->pipeline_fa_int8qk->push_constant_size);
+        }
+        ggml_vk_dispatch_pipeline(ctx, subctx, ctx->device->pipeline_fa_int8qk,
+                                  { q8_sub, k8_sub, v_buf, sc_sub, dst_buf }, pcf,
+                                  { (uint32_t) Tr, heads, 1 });
     } else if (split_k > 1) {
         ggml_pipeline_request_descriptor_sets(ctx, ctx->device->pipeline_flash_attn_split_k_reduce, 1);
 
@@ -17349,6 +17515,9 @@ static void * ggml_backend_vk_get_proc_address(ggml_backend_reg_t reg, const cha
     }
     if (strcmp(name, "ggml_backend_clear_buffer_cache") == 0) {
         return reinterpret_cast<void *>(ggml_backend_vk_clear_buffer_cache);
+    }
+    if (strcmp(name, "ggml_backend_vk_set_fa_int8_qk") == 0) {
+        return reinterpret_cast<void *>(ggml_backend_vk_set_fa_int8_qk);
     }
     return nullptr;
 }
