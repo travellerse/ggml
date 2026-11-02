@@ -39,7 +39,7 @@ layout (binding = 3) readonly buffer I {uvec2 data_i[];};
 #endif
 
 #extension GL_EXT_control_flow_attributes : enable
-#define BLOCK_SIZE 512
+#define BLOCK_SIZE 128
 
 layout (constant_id = 1) const bool do_multiply = false;
 #if RMS_NORM_ADD_FUSION
@@ -111,7 +111,7 @@ void rms_norm(uint num_iters) {
                         }
                         FLOAT_TYPE value = scale * FLOAT_TYPE(data_a[a_offset + col]) * FLOAT_TYPE(data_b[b_offset + fastmod(col, p.ne10)]);
 #if RMS_NORM_ADD_FUSION
-                        value += FLOAT_TYPE(data_c[d_offset + col]);
+                        value += FLOAT_TYPE(data_c[(p.param2 > 0.5) ? col : (d_offset + col)]);
                         if (do_post_multiply) {
                             value *= FLOAT_TYPE(data_e[0]);
                         }
@@ -125,7 +125,7 @@ void rms_norm(uint num_iters) {
                         }
                         FLOAT_TYPE value = scale * FLOAT_TYPE(data_a[a_offset + col]) * FLOAT_TYPE(data_b[b_offset + col]);
 #if RMS_NORM_ADD_FUSION
-                        value += FLOAT_TYPE(data_c[d_offset + col]);
+                        value += FLOAT_TYPE(data_c[(p.param2 > 0.5) ? col : (d_offset + col)]);
                         if (do_post_multiply) {
                             value *= FLOAT_TYPE(data_e[0]);
                         }
