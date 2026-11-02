@@ -11096,6 +11096,8 @@ void ggml_vk_rms_norm(ggml_backend_vk_context * ctx, vk_context& subctx, const s
 
         const uint32_t num_partials = ctx->do_add_rms_partials ? ggml_vk_rms_num_partials(ctx, dst) : 0;
         vk_op_binary_push_constants pc = ggml_vk_rms_norm_push_constants(src0, weight, dst, op_params[0], num_partials);
+        // param2 tells the shader the residual is a per-column vector
+        pc.param2 = ggml_are_same_shape(add, residual) ? 0.0f : 1.0f;
         init_pushconst_tensor_offsets(ctx, pc, src0, weight, residual, post_scale, dst);
 
         vk_pipeline pipeline;
@@ -14080,8 +14082,14 @@ bool ggml_vk_can_fuse(const ggml_backend_vk_context * ctx, const struct ggml_cgr
             if (add->src[0] != mul && add->src[1] != mul) {
                 return false;
             }
+            // The residual may be a per-column vector broadcast over all rows,
+            // which is how per-channel modulation is expressed.
+            const bool residual_same_shape = ggml_are_same_shape(add, residual);
+            const bool residual_row_bcast  = !residual_same_shape &&
+                                             residual->ne[0] == add->ne[0] &&
+                                             residual->ne[1] == 1 && residual->ne[2] == 1 && residual->ne[3] == 1;
             if (residual->type != GGML_TYPE_F32 || add->type != GGML_TYPE_F32 ||
-                !ggml_are_same_shape(add, residual) || !ggml_is_contiguous(residual) ||
+                (!residual_same_shape && !residual_row_bcast) || !ggml_is_contiguous(residual) ||
                 !ggml_is_contiguous(add) || get_misalign_bytes(ctx, residual) != 0) {
                 return false;
             }
