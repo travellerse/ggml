@@ -1006,6 +1006,10 @@ struct vk_device_struct {
     bool fa_sparse_compact_use_subgroups;
 
     vk_pipeline pipeline_flash_attn_split_k_reduce;
+    // experimental INT8-QK attention prototype (GGML_VK_FA_INT8QK)
+    vk_pipeline pipeline_fa_int8qk;
+    vk_pipeline pipeline_quantize_qk_i8;
+    vk_pipeline pipeline_quantize_qk_i8_f16;
     std::map<std::tuple<uint32_t, uint32_t, uint32_t, uint32_t>, std::pair<vk_pipeline, vk_pipeline>> pipeline_xe_fa_decode_dual_phases;
     vk_pipeline pipeline_count_experts;
 

@@ -24,6 +24,11 @@ GGML_BACKEND_API ggml_backend_buffer_type_t ggml_backend_vk_host_buffer_type(voi
 
 GGML_BACKEND_API ggml_backend_reg_t ggml_backend_vk_reg(void);
 
+// Experimental INT8-QK flash-attention path (MOSS-Image prototype).
+// mode: 1 = force on, 0 = force off, -1 = follow the GGML_VK_FA_INT8QK env var.
+// Reachable at runtime through ggml_backend_reg_get_proc_address().
+GGML_BACKEND_API void ggml_backend_vk_set_fa_int8_qk(int mode);
+
 #ifdef  __cplusplus
 }
 #endif

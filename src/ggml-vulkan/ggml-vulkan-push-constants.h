@@ -409,6 +409,22 @@ struct vk_op_binary_push_constants {
     float param1; float param2; int32_t param3;
 };
 
+struct vk_fa_int8qk_push_constants {
+    uint32_t N; uint32_t KV; uint32_t n_head;
+    uint32_t q_words; uint32_t k_words;
+    uint32_t q_head_stride; uint32_t k_head_stride;
+    uint32_t v_row_stride; uint32_t v_head_stride; uint32_t v_base;
+    uint32_t o_head_stride; uint32_t o_row_stride;
+    float scale;
+};
+static_assert(sizeof(vk_fa_int8qk_push_constants) % 4 == 0);
+
+struct vk_quantize_qk_i8_push_constants {
+    uint32_t rows; uint32_t words_per_row;
+    uint32_t a_base; uint32_t a_row_stride; uint32_t a_head_stride;
+    uint32_t s_base;
+};
+
 struct vk_op_concat_push_constants : vk_op_binary_push_constants {};
 
 static_assert(sizeof(vk_op_concat_push_constants) == sizeof(vk_op_binary_push_constants));
